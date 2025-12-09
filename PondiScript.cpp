@@ -1,5 +1,5 @@
 // Pondi – Sensor Node (ESP32)
-// Behavior: wake -> idle -> connect -> send (CO2 then CH4) -> cmd -> wait -> wake
+// Behavior: wake -> idle -> connect -> send (CO2 + CH4) Notehub then SD card -> cmd check -> wait -> wake
 // Notes published: "sensors.qo" (CO2/tempC_x10/rh_x10) and "ch4.qo" (ch4_v_mV/ch4_rs_ohm/ch4_ppm)
 
 #include <Wire.h>
@@ -8,8 +8,20 @@
 #include <math.h>
 #include <esp_now.h>
 #include <WiFi.h>
-#include <esp_wifi.h>
+#include "esp_wifi.h"
+#include "FS.h"
+#include "SD.h"
+#include "SPI.h"
 #include "secrets.h"
+
+// SD card SPI pins
+#define SCK 14 
+#define MISO 12
+#define MOSI 13
+#define CS 15
+bool sd_ok = false;
+
+SPIClass spi = SPIClass(HSPI); // SD Card SPI bus
 
 //I2C Buses
 TwoWire scdwire(0);   // SDA=6, SCL=5 @100 kHz
@@ -66,6 +78,14 @@ const uint32_t power_stabilize_ms     = 5000;
 const uint32_t paused_check_period_ms = 5UL * 60UL * 1000UL;
 #define stop_sleep_minutes 10
 
+// Soft clock that persists across deep sleep (seconds since first boot)
+RTC_DATA_ATTR uint64_t soft_epoch_s = 0;   // cumulative seconds
+RTC_DATA_ATTR uint32_t awake_ms_anchor = 0;// millis() snapshot at wake
+
+static inline uint64_t soft_now_s() {
+  return soft_epoch_s + (uint64_t)((millis() - awake_ms_anchor) / 1000UL);
+}
+
 // CH4 & ADC ---------------------------------------------------------------------------------------------------------------
 // TGS2611 divider on ADC1_0 (GPIO1) ; Vout = Vin * (RL / Rs + RL)
 static const int   adc_pin_ch4      = 1;      // ADC1_CH0 = GPIO1 on ESP32-S3
@@ -79,18 +99,18 @@ static const float cal_r1 = 21760.0f;  // Rs ohms @ 300 ppm
 static const float cal_p1 = 300.0f;
 static const float cal_r2 = 4760.0f;   // Rs ohms @ 10k ppm
 static const float cal_p2 = 10000.0f;
-static const float ch4_n  = logf(cal_p2 / cal_p1) / logf(cal_r2 / cal_r1); // n
-static const float ch4_k  = cal_p1 / powf(cal_r1, ch4_n); // k
+static const float ch4_n  = logf(cal_p2 / cal_p1) / logf(cal_r2 / cal_r1); // n for p fit
+static const float ch4_k  = cal_p1 / powf(cal_r1, ch4_n); // k for p fit
 
 //CH4 heater duty-cycle control------------------------------------------------------------------------------------
 static const int  heaterPin            = 37;     // MOSFET gate GPIO
-static const int  heater_on_level      = HIGH;   // HIGH = ON (low-side N-MOSFET)
-static const int  heater_off_level     = LOW;    // LOW = OFF
+static const int  HEATER_ON_LEVEL      = HIGH;   // HIGH = ON (low-side N-MOSFET)
+static const int  HEATER_OFF_LEVEL     = LOW;    // LOW = OFF
 
 // Period 120s, ON 45s (~37.5%); Read CH4 after ≥30s ON for stability
-static const uint32_t heater_duty_period_ms         = 120000UL;
-static const uint32_t heater_duty_on_ms             =  45000UL;
-static const uint32_t heater_min_on_for_read_ms     =  30000UL;
+static const uint32_t HEATER_DUTY_PERIOD_MS         = 120000UL;
+static const uint32_t HEATER_DUTY_ON_MS             =  45000UL;
+static const uint32_t HEATER_MIN_ON_FOR_READ_MS     =  30000UL;
 
 static bool     heaterIsOn       = false;
 static bool     heaterDutyEnable = false;
@@ -98,7 +118,7 @@ static uint32_t heaterEdgeMs     = 0;
 static uint32_t heaterOnStartMs  = 0;
 
 static inline void heaterWrite(bool on) { // to actually control the mosfet switch
-  digitalWrite(heaterPin, on ? heater_on_level : heater_off_level);
+  digitalWrite(heaterPin, on ? HEATER_ON_LEVEL : HEATER_OFF_LEVEL);
   if (on) {
     if (!heaterIsOn) {
       heaterOnStartMs = millis();
@@ -140,18 +160,18 @@ static uint32_t heaterOnElapsedMs() { // timer to track ON period
   return heaterIsOn ? (millis() - heaterOnStartMs) : 0;
 }
 
-static void heaterDutyTick() { // change on/off state based on cycle timing and update change time
+static void heaterDutyTick() { 
   if (!heaterDutyEnable) return;
   const uint32_t now = millis();
   const uint32_t elapsed = now - heaterEdgeMs;
 
   if (heaterIsOn) {
-    if (elapsed >= heater_duty_on_ms) {
+    if (elapsed >= HEATER_DUTY_ON_MS) {
       heaterWrite(false);
       heaterEdgeMs = now;
     }
   } else {
-    if (elapsed >= (heater_duty_period_ms - heater_duty_on_ms)) {
+    if (elapsed >= (HEATER_DUTY_PERIOD_MS - HEATER_DUTY_ON_MS)) {
       heaterWrite(true);
       heaterEdgeMs = now;
     }
@@ -160,7 +180,7 @@ static void heaterDutyTick() { // change on/off state based on cycle timing and 
 
 static inline int32_t ms_since(uint32_t start) { return (int32_t)(millis() - start); } //timer
 
-static int readADCmV_fastGroup() { // Average a small group using calibrated millivolts (16 averaged one-shot reads)
+static int readADCmV_fastGroup() { // Average a small group using calibrated millivolts
   uint32_t acc = 0;
   for (int i = 0; i < adc_samples_fast; ++i) {
     acc += (uint32_t)analogReadMilliVolts(adc_pin_ch4);  // calibrated mV
@@ -171,7 +191,7 @@ static int readADCmV_fastGroup() { // Average a small group using calibrated mil
 
 static void takeOneCH4Reading_avg25() {
   analogReadResolution(12); // Max resolution = 3.1V / 2^(12) - 1 = 3.1V/4095 => .757mV
-  analogSetPinAttenuation(adc_pin_ch4, ADC_11db); // 11 dB ~ 0-3.1V V full-scale per esp32-s3 docs; allows for accurate readings up to around 6000-7000ppm
+  analogSetPinAttenuation(adc_pin_ch4, ADC_11db); //11 dB ~ 0-3.1V V full-scale per esp32 docs; allows for accurate readings up to around 6-7000ppm
                                                   // I sure hope emissions from ponds do not surpass this! That's a lot of methane!
 
   int64_t sum_mv = 0;
@@ -195,6 +215,124 @@ static void takeOneCH4Reading_avg25() {
   last_ch4_ppm = ppm_i;
 
   Serial.printf("CH4(avg25): Vnode=%d mV  Rs=%d ohm  CH4≈ %d ppm\n", mv, rs_i, ppm_i);
+}
+
+// SD Card ---------------------------------------------------------------------------------------------------
+// functions from "https://RandomNerdTutorials.com/esp32-microsd-card-arduino/"--------------------------
+
+void listDir(fs::FS &fs, const char * dirname, uint8_t levels){
+  Serial.printf("Listing directory: %s\n", dirname);
+
+  File root = fs.open(dirname);
+  if(!root){
+    Serial.println("Failed to open directory");
+    return;
+  }
+  if(!root.isDirectory()){
+    Serial.println("Not a directory");
+    return;
+  }
+
+  File file = root.openNextFile();
+  while(file){
+    if(file.isDirectory()){
+      Serial.print("  DIR : ");
+      Serial.println(file.name());
+      if(levels){
+        listDir(fs, file.name(), levels -1);
+      }
+    } else {
+      Serial.print("  FILE: ");
+      Serial.print(file.name());
+      Serial.print("  SIZE: ");
+      Serial.println(file.size());
+    }
+    file = root.openNextFile();
+  }
+}
+
+void createDir(fs::FS &fs, const char * path){
+  Serial.printf("Creating Dir: %s\n", path);
+  if(fs.mkdir(path)){
+    Serial.println("Dir created");
+  } else {
+    Serial.println("mkdir failed");
+  }
+}
+
+void removeDir(fs::FS &fs, const char * path){
+  Serial.printf("Removing Dir: %s\n", path);
+  if(fs.rmdir(path)){
+    Serial.println("Dir removed");
+  } else {
+    Serial.println("rmdir failed");
+  }
+}
+
+void readFile(fs::FS &fs, const char * path){
+  Serial.printf("Reading file: %s\n", path);
+
+  File file = fs.open(path);
+  if(!file){
+    Serial.println("Failed to open file for reading");
+    return;
+  }
+
+  Serial.print("Read from file: ");
+  while(file.available()){
+    Serial.write(file.read());
+  }
+  file.close();
+}
+
+void writeFile(fs::FS &fs, const char * path, const char * message){
+  Serial.printf("Writing file: %s\n", path);
+
+  File file = fs.open(path, FILE_WRITE);
+  if(!file){
+    Serial.println("Failed to open file for writing");
+    return;
+  }
+  if(file.print(message)){
+    Serial.println("File written");
+  } else {
+    Serial.println("Write failed");
+  }
+  file.close();
+}
+
+void appendFile(fs::FS &fs, const char * path, const char * message){
+  Serial.printf("Appending to file: %s\n", path);
+
+  File file = fs.open(path, FILE_APPEND);
+  if(!file){
+    Serial.println("Failed to open file for appending");
+    return;
+  }
+  if(file.print(message)){
+    Serial.println("Message appended");
+  } else {
+    Serial.println("Append failed");
+  }
+  file.close();
+}
+
+void renameFile(fs::FS &fs, const char * path1, const char * path2){
+  Serial.printf("Renaming file %s to %s\n", path1, path2);
+  if (fs.rename(path1, path2)) {
+    Serial.println("File renamed");
+  } else {
+    Serial.println("Rename failed");
+  }
+}
+
+void deleteFile(fs::FS &fs, const char * path){
+  Serial.printf("Deleting file: %s\n", path);
+  if(fs.remove(path)){
+    Serial.println("File deleted");
+  } else {
+    Serial.println("Delete failed");
+  }
 }
 
 //ESP-NOW TX Callback ----------------------------------------------------------------------------------------
@@ -337,20 +475,22 @@ void note_setHubMode(const char* mode, bool wifiOnly) { // To set to minimum or 
   Serial.printf("Notecard mode -> %s\n", mode);
 }
 
-bool note_waitConnected() { // Wait until connection is established and then secure
-  Serial.println("Waiting for Notehub connection...");
+bool note_waitConnected(uint32_t timeout_ms) { // Wait until connection is established and then secure
+  Serial.println("Waiting for Notehub connection (bounded)...");
+  const uint32_t deadline = millis() + timeout_ms;
   for (;;) {
     J *req = notecard.newRequest("hub.status");
-    if (!req) { delay(1000); continue; }
-    J *rsp = notecard.requestAndResponse(req);
-    if (!rsp) { Serial.println("  hub.status timeout"); delay(1000); continue; }
-
-    const bool connected = JGetBool(rsp, "connected");
-    const char* status   = JGetString(rsp, "status");
-    Serial.printf("  connected=%s  status=%s\n", connected ? "true" : "false", status ? status : "(null)");
-    notecard.deleteResponse(rsp);
-
-    if (connected) { Serial.println("Connected; settling 3s..."); delay(3000); return true; }
+    if (req) {
+      J *rsp = notecard.requestAndResponse(req);
+      if (rsp) {
+        bool connected = JGetBool(rsp, "connected");
+        const char* status = JGetString(rsp, "status");
+        Serial.printf("  connected=%s status=%s\n", connected ? "true" : "false", status ? status : "(null)");
+        notecard.deleteResponse(rsp);
+        if (connected) { delay(3000); return true; }
+      }
+    }
+    if ((int32_t)(millis() - deadline) >= 0) return false;
     delay(1000);
   }
 }
@@ -438,6 +578,8 @@ void goToTimedSleep(uint32_t minutes) {
   scdSend(cmd_stop, "Sleep: SCD40 idle");
   note_setHubMode("minimum", true);
   Serial.printf("Entering deep sleep for %u minute(s).\n", (unsigned)minutes);
+  soft_epoch_s += (uint64_t)((millis() - awake_ms_anchor) / 1000UL); //for soft clock offline writes
+  soft_epoch_s += (uint64_t)minutes * 60ULL;
   delay(200);
   uint64_t us = (uint64_t)minutes * 60ULL * 1000000ULL;
   esp_sleep_enable_timer_wakeup(us);
@@ -461,8 +603,8 @@ static void issue_FRC(uint16_t refppm) { // Command for forced recalibration to 
   Serial.println("FRC issued.");
 }
 
-void do_flush_blocking() { // set everything to minimum to allow pumps max current
-  Serial.println("[FLUSH] Preparing rails, pausing everything else...");
+void do_flush_blocking() {
+  Serial.println("[FLUSH] Preparing rails, pausing everything else..."); // set everything to minimum to allow pumps max current
   scdSend(cmd_stop, "Stop SCD40 for flush");
   note_setHubMode("minimum", true);
   delay(300);
@@ -537,18 +679,18 @@ bool note_fetchAndExecuteCommand() {
   else if (!strcasecmp(cmd, "start")) {
     Serial.println("Start requested: restarting MCU.");
     delay(100);
-    ESP.restart(); // software restart
+    ESP.restart();
   }
   else if (!strcasecmp(cmd, "detreq")) {
     paused = true;
     scdSend(cmd_stop, "detreq: stop SCD40");
     note_setHubMode("continuous", true);
-    note_waitConnected();
+    (void)note_waitConnected(20000);
     note_publishDeviceInfo();
     note_setHubMode("minimum", true);
     Serial.println("detreq complete; device remains paused.");
   }
-  else if (!strcasecmp(cmd, "frc")) { // forced recal
+  else if (!strcasecmp(cmd, "frc")) {
     int refppm = arg ? atoi(arg) : 0;
     if (refppm>=350 && refppm<=2000) issue_FRC((uint16_t)refppm);
     else Serial.println("FRC ignored: ppm out of range (350..2000).");
@@ -557,14 +699,15 @@ bool note_fetchAndExecuteCommand() {
     do_flush_blocking();
   }
 
-  notecard.deleteResponse(rsp); // delete lingering cmd notes
+  notecard.deleteResponse(rsp);
   return true;
 }
 
-bool connectAndCheckOnce() { // happens every 5 minutes during paused state
+bool connectAndCheckOnce() {
   Serial.println("[CMD-CHECK] Bringing Notecard online to check commands...");
   note_setHubMode("continuous", true);
-  note_waitConnected();
+  (void)note_waitConnected(20000);
+  awake_ms_anchor = millis();   // re-anchor soft clock after the blocking wait
 
   bool handled_any = false;
   for (int attempts = 0; attempts < 5; ++attempts) {
@@ -573,6 +716,7 @@ bool connectAndCheckOnce() { // happens every 5 minutes during paused state
     handled_any = true;
   }
 
+  note_setHubMode("minimum", true);
   Serial.println("[CMD-CHECK] Done.");
   return handled_any;
 }
@@ -613,7 +757,20 @@ void setup() {
   scdwire.begin(6, 5, 100000); // init scd40 i2c
   notewire.begin(8, 7, 50000); // init notecard i2c 
 
-  notecard.begin(0x17, 50000, notewire); // set notecard bus speed 50khz (Testing proved more reliable w/ this bus speed, 100kHz often left failed connection to wifi)
+  spi.begin(SCK, MISO, MOSI, CS); // init SD card spi
+
+  if (!SD.begin(CS, spi, 40000000)) { // Write data file if it doesn't exist yet, change bus speed to 20Mhz if 40Mhz unreliable
+    Serial.println("SD init failed; continuing without SD logging");
+    sd_ok = false;} 
+  else {
+    sd_ok = (SD.cardType() != CARD_NONE);
+    if (sd_ok && !SD.exists("/data.csv")) {
+      writeFile(SD, "/data.csv", "soft_s,tempC_x10,rh_x10,co2_ppm,ch4_v_mV,ch4_rs_ohm,ch4_ppm\r\n");}
+  }
+
+  awake_ms_anchor = millis(); // for soft-clock offline data writing
+
+  notecard.begin(0x17, 50000, notewire); // set bus speed 50khz
   notecard.setDebugOutputStream(Serial); // debug sent to serial output
 
   note_configureWifiOnce(); // wifi config from password and network name & then set to minimum
@@ -677,7 +834,7 @@ void loop() {
       paused = true;
       scdSend(cmd_stop, "detreq: stop SCD40");
       note_setHubMode("continuous", true);
-      note_waitConnected();
+      (void)note_waitConnected(20000);
       note_publishDeviceInfo();
       note_setHubMode("minimum", true);
       next_paused_check_at = millis() + paused_check_period_ms;
@@ -721,7 +878,7 @@ void loop() {
         next_read_at += 5000UL;
       }
       if (elapsed >= dur_wake) {
-        if (heaterOnElapsedMs() >= heater_min_on_for_read_ms) {// ensure heater was ON long enough before CH4 read
+        if (heaterOnElapsedMs() >= HEATER_MIN_ON_FOR_READ_MS) {// ensure heater was ON long enough before CH4 read
           Serial.println("[HEATER] warm enough for CH4 read");
           takeOneCH4Reading_avg25(); 
         } else {
@@ -741,13 +898,29 @@ void loop() {
     case ST_CONNECT:
       if (!did_connect) {
         note_setHubMode("continuous", true);
-        if (note_waitConnected()) did_connect = true;
+        (void)note_waitConnected(20000);   // try up to ~20s, then continue regardless
+        awake_ms_anchor = millis();   // re-anchor soft clock after blocking wait
+        note_setHubMode("minimum", true);  // back to low power if failed
+        did_connect = true;
       }
-      if (did_connect) state_complete = true;
+      state_complete = true;
       break;
 
     case ST_SEND:
-      if (!did_send) { (void)note_sendLatest(); did_send = true; }
+      if (!did_send) { (void)note_sendLatest(); did_send = true; } //Notehub write
+
+      if (sd_ok) { //SD card write
+        String dataMessage =
+          String((uint32_t)soft_now_s()) + "," +
+          String(last_temp10) + "," +
+          String(last_rh10)   + "," +
+          String(last_co2)    + "," +
+          String(last_ch4_mv) + "," +
+          String(last_ch4_rs) + "," +
+          String(last_ch4_ppm) + "\r\n";
+        appendFile(SD, "/data.csv", dataMessage.c_str());
+      }
+
       if (elapsed >= dur_send) state_complete = true;
       break;
 
